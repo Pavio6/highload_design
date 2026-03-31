@@ -6,6 +6,9 @@
 - [2. Расчет нагрузки](#section-2)
 - [3. Глобальная балансировка](#section-3)
 - [4. Локальная балансировка](#section-4)
+- [5. Логическая схема базы данных](#section-5)
+- [6. Физическая схема базы данных](#section-6)
+- [7. Алгоритмы](#section-7)
 
 <a id="section-1"></a>
 # 1. Тема, аудитория, функционал
@@ -295,7 +298,7 @@ TTL для динамических доменов: 20-60 сек [3].
 
 Anycast используется на edge-уровне DNS/CDN для маршрутизации в ближайшую точку присутствия [4].
 
-Для WebSocket (danmaku) в core-контуре опора на Anycast не делается: используется региональная привязка комнаты и stickiness-сессий.
+Для WebSocket (danmaku) в core-контуре опора на Anycast не делается: применяется региональная привязка комнаты и stickiness-сессий.
 
 ## 3.5 Регулировка трафика между ДЦ
 
@@ -430,3 +433,202 @@ API-пул задается как baseline + авторасширение:
 2. NGINX WebSocket proxying: https://nginx.org/en/docs/http/websocket.html
 3. Kubernetes Ingress Concepts: https://kubernetes.io/docs/concepts/services-networking/ingress/
 4. Kubernetes Service Concepts: https://kubernetes.io/docs/concepts/services-networking/service/
+
+<a id="section-5"></a>
+# 5. Логическая схема базы данных
+
+![DB Schema](images/public.png)
+
+## 5.1 Логическая модель и состав таблиц
+
+| Таблица | Назначение | Особенности |
+|---|---|---|
+| `users` | аккаунты и профиль | справочные данные пользователя, редкие изменения |
+| `rooms` | метаданные комнаты стрима | привязка комнаты к стримеру и primary-региону |
+| `messages` | основной журнал danmaku | самая тяжелая таблица по записи и объему |
+| `room_presence` | online-состояние сессий | эфемерные данные с TTL, рабочий набор в RAM |
+| `user_room_rate_limit` | лимиты отправки сообщений | короткие окна, частые инкременты счетчиков |
+| `moderation_bans` | room/global баны | проверка перед публикацией сообщения |
+| `moderation_dictionary` | словарь правил модерации | небольшой справочник, редкие обновления |
+| `moderation_events` | журнал решений модерации | audit-лог, асинхронная запись |
+| `message_delivery_cursor` | курсор клиента при reconnect | last delivered message для мягкого восстановления |
+| `sessions` | пользовательские сессии авторизации | управление токенами и logout |
+| `room_settings` | конфигурация комнаты | slow-mode, лимиты, флаги модерации |
+| `moderation_review_queue` | очередь ручной модерации | сообщения со статусом `pending_review` |
+
+## 5.2 Исходные допущения для расчета
+
+| Параметр | Значение | Комментарий |
+|---|---:|---|
+| `RPS_danmaku_avg` | `~2 100 msg/s` | midpoint из диапазона раздела 2 |
+| `RPS_danmaku_peak` | `6 843 msg/s` | верхняя граница пика из раздела 2 |
+| `messages_per_day` | `~181,4 млн/сутки` | `2 100 * 86 400` |
+| `retention_messages_hot` | `30 дней` | онлайн-контур для последних сообщений |
+| `CCU_live_peak` | `~2,46 млн` | верхняя граница из раздела 2 |
+| `join_rps_peak` | `~1 368 rps` | `CCU_live_peak / 1800`, при сессии ~30 мин |
+| `moderation_hit_ratio` | `~1%` | доля сообщений с действием модерации |
+
+## 5.3 Оценка размера строк
+
+| Таблица | Оценка средней строки | Основание |
+|---|---:|---|
+| `users` | `~96 B` | `id + nickname + status + timestamps` |
+| `rooms` | `~128 B` | `id + streamer_id + title + region + status + timestamps` |
+| `messages` | `~220 B` | `id + room_id + user_id + body(~140B avg) + flags + ts + metadata` |
+| `room_presence` | `~96 B` | `room_id + user_id + session_id + gateway + heartbeats` |
+| `user_room_rate_limit` | `~56 B` | ключ окна + счетчик + blocked_until |
+| `moderation_bans` | `~80 B` | scope + user + reason(short) + expires + ts |
+| `moderation_dictionary` | `~64 B` | term + policy + language + ts |
+| `moderation_events` | `~128 B` | room/user/message/rule/action + ts + details |
+| `message_delivery_cursor` | `~80 B` | room/user/session + last_message_id + ts |
+| `sessions` | `~160 B` | user_id + refresh/session token hash + ip/ua + expires_at |
+| `room_settings` | `~96 B` | room_id + slow_mode + limits + flags + updated_at |
+| `moderation_review_queue` | `~72 B` | message_id + rule_id + priority + status + created_at |
+
+## 5.4 Требования к консистентности
+
+| Таблица | Консистентность | Обоснование |
+|---|---|---|
+| `users` | strong | профиль/статус пользователя не должен расходиться при авторизации |
+| `rooms` | strong | состояние комнаты важно для корректного входа |
+| `messages` | strong на запись в primary, eventual межрегионально | в своем регионе сообщение должно фиксироваться сразу |
+| `room_presence` | eventual | допустимы краткие рассинхронизации heartbeats |
+| `user_room_rate_limit` | eventual | небольшая погрешность окна допустима |
+| `moderation_bans` | strong | бан должен применяться немедленно |
+| `moderation_dictionary` | strong | единые правила фильтрации в рамках региона |
+| `moderation_events` | eventual | audit-лог может записываться асинхронно |
+| `message_delivery_cursor` | eventual | курсор восстанавливается best-effort |
+| `sessions` | strong | logout и отзыв токена должны применяться сразу |
+| `room_settings` | strong | лимиты комнаты должны применяться мгновенно |
+| `moderation_review_queue` | eventual | очередь ручной проверки допускает задержку |
+
+## 5.5 Особенности распределения нагрузки по ключам
+
+| Таблица | Ключ распределения | Характер нагрузки |
+|---|---|---|
+| `users` | `user_id` | относительно равномерная |
+| `rooms` | `room_id`, `streamer_id` | перекос в пользу популярных стримеров |
+| `messages` | `room_id + created_at` | выраженные hot-keys для горячих комнат |
+| `room_presence` | `room_id` | очень сильная концентрация на топ-комнатах |
+| `user_room_rate_limit` | `room_id + user_id + window_ts` | всплески в пике и ивентах |
+| `moderation_bans` | `user_id`, `scope_id` | локальные всплески по room-ban |
+| `moderation_dictionary` | `term` | read-heavy справочник |
+| `moderation_events` | `room_id + created_at` | write-heavy в пиках по hot-room |
+| `message_delivery_cursor` | `room_id + user_id + session_id` | распределено по online-аудитории |
+| `sessions` | `user_id + session_id` | равномерно, но всплески при логин-ивентах |
+| `room_settings` | `room_id` | редкие записи, частые чтения в горячих комнатах |
+| `moderation_review_queue` | `priority + created_at` | burst в периоды токсичных всплесков |
+
+<a id="section-6"></a>
+# 6. Физическая схема базы данных
+
+![Physical DB Mapping](images/2026-03-05-2250.excalidraw.png)
+
+## 6.1 Компонентная привязка таблиц к хранилищам
+
+| Логическая таблица (раздел 5) | Физическое размещение | Шардирование / партиции | Срок хранения | Комментарий |
+|---|---|---|---|---|
+| `users` | PostgreSQL (`profile_db.users`) | без шардирования на MVP, далее по `user_id` | весь срок жизни аккаунта | источник истины для профиля и статуса |
+| `rooms` | PostgreSQL (`room_db.rooms`) | без шардирования на MVP | весь срок жизни комнаты | метаданные комнаты и региональная привязка |
+| `messages` | Redis Streams (`realtime_cache`) + ClickHouse (`danmaku_history`) | Redis key по `room_id`; CH partition по `toDate(created_at)`, shard по `cityHash64(room_id)` | Redis 1-3 дня, CH 30-90 дней | единая логическая таблица, но два физических слоя: hot + durable |
+| `room_presence` | Redis (`presence_db`) | hash slot по `room_id` | TTL 60-120 сек | online-состояние участников |
+| `user_room_rate_limit` | Redis (`ratelimit_db`) | key по `room_id:user_id:window` | TTL 1-5 мин | высокочастотные счетчики лимитов |
+| `moderation_bans` | PostgreSQL (`moderation_db.moderation_bans`) | индексный доступ по `user_id, scope_id` | до истечения + архив | бан применяется синхронно |
+| `moderation_dictionary` | PostgreSQL (`moderation_db.moderation_dictionary`) + Redis cache | без шардирования | постоянный | read-heavy словарь правил |
+| `moderation_events` | ClickHouse (`moderation_audit`) | partition по дате, shard по `room_id` | 90-180 дней | дешёвый аудит и аналитика |
+| `message_delivery_cursor` | Redis (`cursor_db`) + async snapshot в PostgreSQL | key по `room_id:user_id:session_id` | TTL 1-24 ч | состояние для reconnect |
+| `sessions` | PostgreSQL (`auth_db.sessions`) + Redis token cache | shard по `user_id` при росте | срок жизни токена + 7 дней | управление сессиями и отзывом токенов |
+| `room_settings` | PostgreSQL (`room_db.room_settings`) + Redis cache | key по `room_id` | постоянный | runtime-настройки комнаты |
+| `moderation_review_queue` | Kafka (`mod_review`) + PostgreSQL (`moderation_db.review_tasks`) | Kafka partition по `room_id` | 7-30 дней | ручная модерация и SLA-очередь |
+
+## 6.2 Индексы и ключи
+
+| Контур | Индексы / ключи |
+|---|---|
+| PostgreSQL `users` | `pk(user_id)`, `ux(nickname)` |
+| PostgreSQL `sessions` | `pk(session_id)`, `ux(refresh_token_hash)`, `idx(user_id, created_at)` |
+| PostgreSQL `rooms` | `pk(room_id)`, `idx(streamer_id)`, `idx(region_primary)` |
+| PostgreSQL `room_settings` | `pk(room_id)` |
+| PostgreSQL `moderation_bans` | `pk(ban_id)`, `idx(user_id, scope_type, scope_id)`, `idx(expires_at)` |
+| PostgreSQL `moderation_dictionary` | `pk(term_id)`, `ux(term, language)` |
+| PostgreSQL `moderation_review_queue` | `pk(review_id)`, `idx(status, priority, created_at)` |
+| ClickHouse `messages` | `ORDER BY (room_id, created_at, message_id)` |
+| ClickHouse `moderation_events` | `ORDER BY (room_id, created_at, event_id)` |
+| Redis `presence/rate_limit/cursor` | ключи с префиксами: `presence:*`, `rl:*`, `cursor:*` |
+| Kafka `danmaku_ingest` | partition key = `room_id` для сохранения порядка в комнате |
+
+## 6.3 Резервное копирование и отказоустойчивость
+
+| Система | Репликация | Backup |
+|---|---|---|
+| PostgreSQL | `1 primary + 2 replicas` | base backup + WAL, ежедневный logical dump |
+| Redis | Redis Sentinel/Cluster, `1 replica` на shard | RDB snapshot + AOF rewrite |
+| Kafka | `RF=3`, `min.insync.replicas=2` | tiered storage или mirror-кластер |
+| ClickHouse | `2 replicas` на shard | backup в S3-совместимое хранилище |
+
+<a id="section-7"></a>
+# 7. Алгоритмы
+
+Наиболее сложным алгоритмом в сервисе является алгоритм обработки danmaku в горячих комнатах: от входящего сообщения до модерации, упорядочивания и fan-out доставки миллионам клиентов.
+
+## 7.1 Основные проблемы
+
+| Проблема | Описание |
+|---|---|
+| Burst-нагрузка в hot-room | Всплески входящих сообщений в секунду приводят к перегрузке gateway/broker и очередей доставки |
+| Спам и токсичный контент | Нужно быстро отсекать flood и нежелательные сообщения без большой задержки |
+| Потеря порядка и дублей | При reconnect пользователь может получить дубликаты или пропуски сообщений |
+| Нестабильная задержка доставки | При backpressure растет p95/p99 latency и ухудшается пользовательский опыт |
+
+## 7.2 Алгоритм антиспама и модерации на входе
+
+Для каждого входящего сообщения применяется последовательный конвейер:
+
+1. Проверка `moderation_bans` (global/room scope).
+2. Проверка `user_room_rate_limit` (скользящее окно или token bucket по ключу `room_id:user_id`).
+3. Проверка словаря `moderation_dictionary`:
+   `block` -> отклонить, `mask` -> замаскировать, `review` -> поместить в `moderation_review_queue`.
+4. Логирование результата в `moderation_events`.
+5. Допуск только сообщений со статусом `clean`/`masked` в realtime-поток.
+
+Это позволяет ограничить мусорный трафик до fan-out и уменьшить нагрузку на downstream-компоненты.
+
+## 7.3 Алгоритм упорядочивания и доставки в hot-room
+
+Для обеспечения порядка и устойчивости используется следующая схема:
+
+1. Все события комнаты маршрутизируются в один partition (`partition_key = room_id`).
+2. На потоке комнаты присваивается монотонный `seq_id`.
+3. Gateway отправляет сообщения клиенту строго по возрастанию `seq_id`.
+4. На reconnect клиент передает `last_seq_id`; сервер поднимает курсор из `message_delivery_cursor` и досылает gap.
+5. Если lag превысил порог, включается деградационный режим:
+   - отправка only-latest окна;
+   - приоритизация системных и модераторских сообщений.
+
+Цель алгоритма: сохранить порядок в рамках комнаты и не допустить лавинообразной задержки.
+
+## 7.4 Метрики качества алгоритма
+
+Для контроля качества используются метрики:
+
+- `DeliveryLatencyP95`, `DeliveryLatencyP99` — задержка между ingress и доставкой клиенту;
+- `DropRate` — доля сообщений, отброшенных в деградации;
+- `DuplicateRate` — доля повторно доставленных сообщений;
+- `OutOfOrderRate` — доля сообщений, пришедших не по порядку `seq_id`;
+- `ModerationPrecision`, `ModerationRecall` — качество правил модерации по размеченной выборке.
+
+Ключевые SLO для realtime-контура:
+
+1. `DeliveryLatencyP95 <= 250 ms`;
+2. `OutOfOrderRate < 0.1%`;
+3. `DuplicateRate < 0.5%`.
+
+## 7.5 Итоговая система алгоритмов
+
+Итоговый контур объединяет 3 части:
+
+1. ingress-контроль (`bans + rate limit + dictionary moderation`);
+2. упорядочивание и buffer-поток по `room_id`;
+3. recoverability через курсоры и dosend на reconnect.
+
+В совокупности это даёт устойчивую обработку danmaku при пиковых нагрузках и сохраняет приемлемую задержку доставки в горячих комнатах.
