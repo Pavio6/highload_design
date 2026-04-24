@@ -11,6 +11,7 @@
 - [7. Алгоритмы](#section-7)
 - [8. Технологии](#section-8)
 - [9. Обеспечение надежности](#section-9)
+- [10. Схема проекта](#section-10)
 
 <a id="section-1"></a>
 # 1. Тема, аудитория, функционал
@@ -743,3 +744,75 @@ API-пул задается как baseline + авторасширение:
 | `NGINX / gateway node` | падение одной ноды снижает запас по пропускной способности, но не роняет весь realtime-вход |
 | `hot-room pool` | перегрузка isolated-пула влияет прежде всего на конкретную горячую комнату, а не на весь кластер |
 | `Region C` | при недоступности DR-региона система остается работоспособной, но теряет часть failover-резерва |
+
+<a id="section-10"></a>
+# 10. Схема проекта
+
+![Project Schema](images/Architecture_diagram.png)
+
+## 10.1 Внешние клиенты и входные точки
+
+| Клиент / поток | Входная точка | Назначение |
+|---|---|---|
+| Viewer Web / Mobile | `www.bstream.cn`, `api.bstream.cn`, `ws.bstream.cn`, `media.bstream.cn` | открытие страницы, получение метаданных, WebSocket danmaku, загрузка медиа |
+| Streamer | `upload.bstream.cn` / ingest endpoint | передача RTMP/SRT потока и метаданных стрима |
+| Moderator | `api.bstream.cn` | управление банами, словарями, ручной модерацией и review-очередью |
+
+Публичный вход сначала проходит через `DNS / GSLB`, который выбирает регион по `geo + latency + health + load`. Статический и медиа-трафик уходит в CDN, а динамический трафик (`api/ws/upload`) направляется в региональный L4/L7 контур.
+
+## 10.2 Региональный контур
+
+Внутри выбранного региона используется связка `L4 Access Layer -> L7 WS Pool / L7 API Pool`.
+
+| Компонент | Роль |
+|---|---|
+| `L4 Access Layer` | быстрый отказоустойчивый вход в регион, active-standby |
+| `L7 WS Pool` | терминация WebSocket, sticky-сессии, передача в realtime gateway |
+| `L7 API Pool` | HTTP/gRPC API для комнат, профиля, истории, auth, moderation и upload |
+| `Realtime Gateway` | принимает сообщения, держит WebSocket-сессии, выполняет первичные проверки |
+| `In-Memory Room Router` | маршрутизирует события по `room_id` в нужный room-контур |
+| `Room Sequencer` | задает порядок событий внутри комнаты и пишет ordered event-log |
+| `Fan-out Workers` | делят подписчиков комнаты на shard-группы и доставляют события клиентам |
+
+Ключевой принцип схемы: `room_id` является центральным routing-key. API читает `rooms.region_primary`, возвращает клиенту правильный `ws_endpoint`, а все room-scoped данные обрабатываются в primary-регионе комнаты.
+
+## 10.3 Основной поток danmaku
+
+1. Клиент открывает страницу стрима и получает `room_id`, `region_primary`, `ws_endpoint`.
+2. Клиент устанавливает WebSocket через `ws.bstream.cn`.
+3. `Realtime Gateway` проверяет сессию, presence, rate limit, баны и moderation dictionary.
+4. Допущенное сообщение передается в `Room Sequencer`.
+5. Sequencer присваивает порядковую позицию в room-log и пишет событие в Redis Streams / Kafka.
+6. `Fan-out Workers` получают ordered event и параллельно доставляют его subscriber-shards.
+7. Клиентский cursor обновляется в Redis, чтобы reconnect мог дослать пропущенные события.
+
+## 10.4 Async и storage-потоки
+
+| Поток | Назначение | Хранилище / брокер |
+|---|---|---|
+| Hot message log | короткая история, reconnect, быстрый replay | Redis Streams |
+| Durable history | история danmaku за 30-90 дней | ClickHouse |
+| Moderation audit | аудит решений модерации и аналитика | ClickHouse |
+| Review queue | ручная модерация спорных сообщений | Kafka + PostgreSQL |
+| Metadata | пользователи, комнаты, сессии, настройки, баны | PostgreSQL |
+| Runtime state | presence, cursor, rate-limit окна | Redis |
+| Video/media | ingest, origin storage, CDN playback | Object Storage + CDN |
+
+Видео-контур отделен от danmaku: ingest и playback не проходят через realtime-фан-аут, а используют media service, object storage и CDN.
+
+## 10.5 Observability и SLO
+
+Все критичные компоненты отдают метрики, логи и трассировки в observability-контур. Для realtime-пути основными сигналами являются:
+
+- `DeliveryLatencyP95/P99`;
+- `OutOfOrderRate`;
+- `DuplicateRate`;
+- `DropRate`;
+- размер очередей Kafka и fan-out workers;
+- количество активных WebSocket-соединений на gateway;
+- Redis latency и hit-rate для presence/rate-limit/cursor.
+
+## Список использованных источников
+
+1. System Design reference, section 10 project schema: https://github.com/Danykrane/system_design#10-%D1%81%D1%85%D0%B5%D0%BC%D0%B0-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82%D0%B0
+2. Designing High Load Systems reference repository: https://github.com/kolenkoal/Designing-High-Load-Systems
