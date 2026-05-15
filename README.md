@@ -12,6 +12,7 @@
 - [8. Технологии](#section-8)
 - [9. Обеспечение надежности](#section-9)
 - [10. Схема проекта](#section-10)
+- [11. Расчет ресурсов](#section-11)
 
 <a id="section-1"></a>
 # 1. Тема, аудитория, функционал
@@ -816,3 +817,164 @@ API-пул задается как baseline + авторасширение:
 
 1. System Design reference, section 10 project schema: https://github.com/Danykrane/system_design#10-%D1%81%D1%85%D0%B5%D0%BC%D0%B0-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82%D0%B0
 2. Designing High Load Systems reference repository: https://github.com/kolenkoal/Designing-High-Load-Systems
+
+<a id="section-11"></a>
+# 11. Расчет ресурсов
+
+## 11.1 База для расчета
+
+Ресурсы считаются не от среднего трафика, а от пикового профиля из раздела 2 и отказоустойчивой схемы из разделов 4 и 9.
+
+| Параметр | Значение |
+|---|---|
+| Глобальный пик WebSocket-соединений | `2 463 300` |
+| Глобальный пик danmaku ingress | `6 843 msg/s` |
+| Hot-room fan-out | `100 000 000 deliveries/s` |
+| Внутренний трафик hot-room fan-out | `~240 Gbit/s` |
+| Глобальный video ingest | `~10.46 Gbit/s` |
+| Глобальный video origin egress | `~95.38 .. 178.84 Gbit/s` |
+| Распределение по регионам | A `40%–45%`, B `40%–45%`, C `10%–20%` |
+
+Для тяжелого региона берем верхнюю границу `45%`:
+
+- `WS_region_worst = 2 463 300 * 45% = 1 108 485` соединений;
+- `RPS_region_worst = 6 843 * 45% = 3 079 msg/s`;
+- `Video_origin_region_worst = 178.84 * 45% = 80.48 Gbit/s`.
+
+## 11.2 Принятые профили узлов
+
+| Контур | Профиль одного узла | Безопасная емкость |
+|---|---|---|
+| `L4 Access` | `8 vCPU / 16 GB RAM / 25 GbE` | входной HA-слой, не является узким местом |
+| `L7 WS / Realtime Gateway` | `16 vCPU / 32 GB RAM / 25 GbE` | `120k` WS-соединений или `~5k msg/s` ingress |
+| `L7 API / Moderation API` | `8 vCPU / 16 GB RAM / 10 GbE` | baseline API-пула |
+| `Fan-out Worker` | `16 vCPU / 32 GB RAM / 25 GbE` | `~2 млн deliveries/s` |
+| `Redis shard` | `16 vCPU / 64 GB RAM / NVMe` | hot-state и короткий room-log |
+| `Kafka broker` | `16 vCPU / 64 GB RAM / 2 TB NVMe / 10 GbE` | room-partitioned event-log |
+| `ClickHouse node` | `16 vCPU / 64 GB RAM / 8 TB SSD / 10 GbE` | history + audit |
+| `PostgreSQL node` | `8 vCPU / 32 GB RAM / 1 TB SSD` | OLTP metadata |
+| `Media origin node` | `16 vCPU / 64 GB RAM / 25 GbE` | origin egress |
+
+## 11.3 Realtime-контур одного тяжелого региона
+
+### WebSocket / gateway слой
+
+Расчет по соединениям:
+
+`N_ws_conn = ceil(1 108 485 / 120 000) = 10`
+
+Расчет по ingress-сообщениям с учетом hot-room burst budget из раздела 4:
+
+`N_ws_msg = ceil((3 079 + 1 500) / 5 000) = 1`
+
+Берем ограничивающий фактор и добавляем `20%` операционного резерва:
+
+`N_ws = ceil(max(10, 1) * 1.2) = 12`
+
+Принято: **12 WS/gateway-узлов baseline**, autoscale до **16**.
+
+### Fan-out слой
+
+Для одной горячей комнаты:
+
+`N_fanout_raw = ceil(100 000 000 / 2 000 000) = 50`
+
+С резервом `20%`:
+
+`N_fanout = ceil(50 * 1.2) = 60`
+
+Проверка по сети:
+
+`60 * 25 Gbit/s = 1 500 Gbit/s > 240 Gbit/s`
+
+Принято: **60 fan-out workers** в изолированном hot-room pool.
+
+### API и входной слой
+
+| Компонент | Количество |
+|---|---|
+| `L4 Access` | `2` узла, active-standby |
+| `L7 WS / Gateway` | `12` baseline, до `16` autoscale |
+| `L7 API` | `4+` узла |
+| `Fan-out Workers` | `60` узлов для hot-room pool |
+
+## 11.4 Хранилища и очереди
+
+### Redis
+
+Для Redis основной объем дает hot room-log, а не presence:
+
+- raw danmaku по тяжелому региону в сутки: `177.37 GB/day * 45% = 79.82 GB/day`;
+- retention hot-layer: `1` день;
+- коэффициент накладных расходов Redis-структур: `~2`;
+- расчетный объем primary-data: `79.82 * 2 = 159.64 GB`.
+
+При `6` primary shards:
+
+`159.64 / 6 = 26.61 GB` на shard.
+
+С `1` replica на shard принимается схема: **6 primary + 6 replica**, по `64 GB RAM` на узел. Этого достаточно для room-log, presence, cursor и rate-limit state с запасом.
+
+### Kafka
+
+`6 843 * 300 B ~= 2.05 MB/s` глобально.
+
+Kafka нужен прежде всего для упорядочивания, буферизации и отказоустойчивости, поэтому принимается минимально надежная схема на регион:
+
+- **3 broker**, `RF=3`, `min.insync.replicas=2`;
+- по `2 TB NVMe` на broker;
+- partition key = `room_id`.
+
+### ClickHouse
+
+Для durable history тяжелого региона берем retention `90` дней:
+
+- raw history: `177.37 GB/day * 45% * 90 = 7.18 TB`;
+- при `2` replicas: `14.36 TB`;
+- с запасом `30%`: `18.67 TB`.
+
+Принято: **4 ClickHouse nodes** по `8 TB SSD`.
+
+### PostgreSQL
+
+PostgreSQL хранит metadata и moderation state, а не bulk danmaku history:
+
+- **3 узла**: `1 primary + 2 replicas`;
+- по `8 vCPU / 32 GB RAM / 1 TB SSD`.
+
+## 11.5 Media-контур
+
+Для тяжелого региона:
+
+- video ingest: `10.46 * 45% = 4.71 Gbit/s`;
+- video origin egress upper bound: `178.84 * 45% = 80.48 Gbit/s`.
+
+По сетевому ограничению для origin:
+
+`N_media_raw = ceil(80.48 / 25) = 4`
+
+С резервом `N+1` принимается: **5 media-origin nodes** на тяжелый регион.
+
+## 11.6 Итоговая оценка
+
+### Один тяжелый регион (A или B)
+
+| Контур | Количество |
+|---|---|
+| `L4 Access` | `2` |
+| `L7 WS / Gateway` | `12` baseline (`до 16`) |
+| `L7 API` | `4+` |
+| `Fan-out Workers` | `60` |
+| `Redis` | `12` (`6 primary + 6 replica`) |
+| `Kafka` | `3` |
+| `ClickHouse` | `4` |
+| `PostgreSQL` | `3` |
+| `Media origin` | `5` |
+
+Итого без autoscale: **105 узлов** на тяжелый регион.
+
+### Глобально
+
+Регионы A и B проектируются как тяжелые active-active регионы. Region C несет `10%–20%` нагрузки и используется как low-weight DR, поэтому для него допустим уменьшенный baseline realtime-пула, но stateful-компоненты сохраняют минимальную HA-схему.
+
+Ключевой вывод: для этой системы главным потребителем ресурсов является не ingress danmaku (`~6.8k msg/s`), а **fan-out горячих комнат** и **video-origin egress**. Именно они определяют число realtime worker-узлов и сетевой профиль платформы.
